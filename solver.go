@@ -3,6 +3,7 @@ package main
 import (
 	"cmp"
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -116,13 +117,7 @@ func (ls *LegoSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan st
 		ListerWatcher: challengelw,
 		ObjectType:    &acmeapisv1.Challenge{},
 		Handler: cache.ResourceEventHandlerFuncs{
-			DeleteFunc: func(obj any) {
-				ls.mux.Lock()
-				defer ls.mux.Unlock()
-
-				ch := obj.(*acmeapisv1.Challenge)
-				delete(ls.providers, providerKey{dnsName: ch.Spec.DNSName, key: ch.Spec.Key})
-			},
+			DeleteFunc: ls.deleteProviderForChallenge,
 		},
 		ResyncPeriod: 0,
 		Indexers:     cache.Indexers{},
@@ -136,11 +131,37 @@ func (ls *LegoSolver) Initialize(kubeClientConfig *rest.Config, stopCh <-chan st
 		cancel()
 	}()
 
-	go ctrl.Run(ls.ctx.Done())
-
 	ls.providers = make(map[providerKey]challenge.Provider)
 
+	go ctrl.Run(ls.ctx.Done())
+
+	if !cache.WaitForCacheSync(ls.ctx.Done(), ctrl.HasSynced) {
+		return errors.New("failed to sync challenge informer cache")
+	}
+
 	return nil
+}
+
+func (ls *LegoSolver) deleteProviderForChallenge(obj any) {
+	challenge, ok := obj.(*acmeapisv1.Challenge)
+	if !ok {
+		tombstone, ok := obj.(cache.DeletedFinalStateUnknown)
+		if !ok {
+			klog.InfoS("Ignoring unexpected delete object", "type", fmt.Sprintf("%T", obj))
+			return
+		}
+
+		challenge, ok = tombstone.Obj.(*acmeapisv1.Challenge)
+		if !ok {
+			klog.InfoS("Ignoring unexpected tombstone object", "type", fmt.Sprintf("%T", tombstone.Obj))
+			return
+		}
+	}
+
+	ls.mux.Lock()
+	defer ls.mux.Unlock()
+
+	delete(ls.providers, providerKey{dnsName: challenge.Spec.DNSName, key: challenge.Spec.Key})
 }
 
 func (ls *LegoSolver) getProvider(ch *v1alpha1.ChallengeRequest) (provider challenge.Provider, err error) {

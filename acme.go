@@ -25,12 +25,12 @@ func (ls *LegoSolver) getKeyAuthorization(ch *v1alpha1.ChallengeRequest) (keyAut
 		return "", "", fmt.Errorf("failed to get challenge: %w", err)
 	}
 
-	privKey, err := ls.getIssuerPrivKey(challenge.Spec.IssuerRef, ch.ResourceNamespace)
+	signer, err := ls.getIssuerPrivateKeySigner(challenge.Spec.IssuerRef, ch.ResourceNamespace)
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get issuer private key: %w", err)
 	}
 
-	th, err := acme.JWKThumbprint(privKey.(crypto.Signer).Public())
+	th, err := acme.JWKThumbprint(signer.Public())
 	if err != nil {
 		return "", "", fmt.Errorf("failed to get JWK thumbprint: %w", err)
 	}
@@ -47,7 +47,7 @@ func (ls *LegoSolver) getKeyAuthorization(ch *v1alpha1.ChallengeRequest) (keyAut
 	return keyAuth, challenge.Spec.Token, nil
 }
 
-func (ls *LegoSolver) getIssuerPrivKey(issuerRef certmanagermetav1.ObjectReference, namespace string) (crypto.PrivateKey, error) {
+func (ls *LegoSolver) getIssuerPrivateKeySigner(issuerRef certmanagermetav1.IssuerReference, resourceNamespace string) (crypto.Signer, error) {
 	var secretKeySelector certmanagermetav1.SecretKeySelector
 
 	switch issuerRef.Kind {
@@ -59,7 +59,7 @@ func (ls *LegoSolver) getIssuerPrivKey(issuerRef certmanagermetav1.ObjectReferen
 
 		secretKeySelector = clusterIssuer.Spec.ACME.PrivateKey
 	case certmanagerv1.IssuerKind:
-		issuer, err := ls.Issuers(namespace).Get(ls.ctx, issuerRef.Name, metav1.GetOptions{})
+		issuer, err := ls.Issuers(resourceNamespace).Get(ls.ctx, issuerRef.Name, metav1.GetOptions{})
 		if err != nil {
 			return nil, fmt.Errorf("failed to get issuer: %w", err)
 		}
@@ -69,7 +69,9 @@ func (ls *LegoSolver) getIssuerPrivKey(issuerRef certmanagermetav1.ObjectReferen
 		return nil, errors.New("unknown issuer kind")
 	}
 
-	secret, err := ls.Secrets(namespace).Get(ls.ctx, secretKeySelector.Name, metav1.GetOptions{})
+	// cert-manager passes the issuer namespace for Issuers and the configured
+	// cluster resource namespace for ClusterIssuers via ChallengeRequest.
+	secret, err := ls.Secrets(resourceNamespace).Get(ls.ctx, secretKeySelector.Name, metav1.GetOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("get secret error: %w", err)
 	}
@@ -86,7 +88,28 @@ func (ls *LegoSolver) getIssuerPrivKey(issuerRef certmanagermetav1.ObjectReferen
 		return nil, errors.New("failed to decode PEM block")
 	}
 
-	return x509.ParsePKCS1PrivateKey(block.Bytes)
+	return parsePrivateKey(block.Bytes)
+}
+
+func parsePrivateKey(der []byte) (crypto.Signer, error) {
+	if key, err := x509.ParsePKCS1PrivateKey(der); err == nil {
+		return key, nil
+	}
+
+	if key, err := x509.ParsePKCS8PrivateKey(der); err == nil {
+		signer, ok := key.(crypto.Signer)
+		if !ok {
+			return nil, fmt.Errorf("unsupported PKCS#8 private key type %T", key)
+		}
+
+		return signer, nil
+	}
+
+	if key, err := x509.ParseECPrivateKey(der); err == nil {
+		return key, nil
+	}
+
+	return nil, errors.New("unsupported private key format")
 }
 
 func (ls *LegoSolver) getChallenge(ch *v1alpha1.ChallengeRequest) (*acmev1.Challenge, error) {
